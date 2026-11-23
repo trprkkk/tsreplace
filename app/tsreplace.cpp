@@ -440,22 +440,88 @@ AVCodecID TSReplaceVideo::getVidCodecID() const {
     return AV_CODEC_ID_NONE;
 }
 
+// AV1 の置き換え映像の codecpar から AV1 video descriptor 用の情報を推定する。
+// シーケンスヘッダや av1C から情報が取得できない場合のフォールバック。
+// AV1 の color_primaries/transfer_characteristics/matrix_coefficients は
+// AVCodecParameters の値とそのまま対応する。
+// (trprkkk/tsreplace の av1BuildVideoDescriptor の考え方を取り込み)
+static RGYAV1SeqHeaderInfo av1SeqHeaderInfoFromCodecPar(const AVCodecParameters *par) {
+    RGYAV1SeqHeaderInfo info;
+    if (par == nullptr) {
+        return info;
+    }
+    info.valid = true;
+    info.seq_profile = (par->profile >= 0) ? (par->profile & 0x07) : 0;
+    info.seq_level_idx_0 = (par->level >= 0) ? (par->level & 0x1f) : 0;
+    info.seq_tier_0 = 0;
+    info.high_bitdepth = 0;
+    info.twelve_bit = 0;
+    info.monochrome = 0;
+    info.chroma_subsampling_x = 1;
+    info.chroma_subsampling_y = 1;
+    info.chroma_sample_position = 0;
+    switch (par->format) {
+    case AV_PIX_FMT_YUV420P10LE: info.high_bitdepth = 1; break;
+    case AV_PIX_FMT_YUV420P12LE: info.high_bitdepth = 1; info.twelve_bit = 1; break;
+    case AV_PIX_FMT_YUV422P:     info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_YUV422P10LE: info.high_bitdepth = 1; info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_YUV422P12LE: info.high_bitdepth = 1; info.twelve_bit = 1; info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_YUV444P:     info.chroma_subsampling_x = 0; info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_YUV444P10LE: info.high_bitdepth = 1; info.chroma_subsampling_x = 0; info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_YUV444P12LE: info.high_bitdepth = 1; info.twelve_bit = 1; info.chroma_subsampling_x = 0; info.chroma_subsampling_y = 0; break;
+    case AV_PIX_FMT_GRAY8:       info.monochrome = 1; break;
+    case AV_PIX_FMT_GRAY10LE:    info.monochrome = 1; info.high_bitdepth = 1; break;
+    case AV_PIX_FMT_GRAY12LE:    info.monochrome = 1; info.high_bitdepth = 1; info.twelve_bit = 1; break;
+    default: break; // YUV420P などはデフォルト値 (8bit 4:2:0)
+    }
+    info.color_primaries = par->color_primaries;
+    info.transfer_characteristics = par->color_trc;
+    info.matrix_coefficients = par->color_space;
+    return info;
+}
+
+// シーケンスヘッダに色情報がない場合、コンテナ側 (codecpar) の色情報で補完する
+static void av1ApplyCodecParColor(RGYAV1SeqHeaderInfo &info, const AVCodecParameters *par) {
+    if (par == nullptr) {
+        return;
+    }
+    constexpr int AV1_COLOR_UNSPECIFIED = 2; // AV1 の CP/TC/MC_UNSPECIFIED
+    if (info.color_primaries == AV1_COLOR_UNSPECIFIED && par->color_primaries != AVCOL_PRI_UNSPECIFIED) {
+        info.color_primaries = par->color_primaries;
+    }
+    if (info.transfer_characteristics == AV1_COLOR_UNSPECIFIED && par->color_trc != AVCOL_TRC_UNSPECIFIED) {
+        info.transfer_characteristics = par->color_trc;
+    }
+    if (info.matrix_coefficients == AV1_COLOR_UNSPECIFIED && par->color_space != AVCOL_SPC_UNSPECIFIED) {
+        info.matrix_coefficients = par->color_space;
+    }
+}
+
 std::vector<uint8_t> TSReplaceVideo::genAV1VideoDescriptor() {
+    const AVCodecParameters *const par = (m_Demux.video.stream) ? m_Demux.video.stream->codecpar : nullptr;
     RGYAV1SeqHeaderInfo info;
     // まず extradata 中の sequence header OBU を試す (color 情報も取れる)
     if (m_Demux.video.extradata && m_Demux.video.extradataSize > 0
         && find_av1_sequence_header(m_Demux.video.extradata, m_Demux.video.extradataSize, info)) {
+        av1ApplyCodecParColor(info, par);
         return gen_av1_video_descriptor(info);
     }
     // extradata の av1C (AV1CodecConfigurationRecord, 先頭4byte) を試す
     if (m_Demux.video.extradata && m_Demux.video.extradataSize >= 4
         && parse_av1_codec_config_record(m_Demux.video.extradata, m_Demux.video.extradataSize, info)) {
+        av1ApplyCodecParColor(info, par);
         return gen_av1_video_descriptor(info);
     }
     // 最初のパケットから探す
     if (m_Demux.video.firstPkt && m_Demux.video.firstPkt->data && m_Demux.video.firstPkt->size > 0
         && find_av1_sequence_header(m_Demux.video.firstPkt->data, m_Demux.video.firstPkt->size, info)) {
+        av1ApplyCodecParColor(info, par);
         return gen_av1_video_descriptor(info);
+    }
+    // シーケンスヘッダ/av1C が取得できない場合は、コーデックパラメータから推定する
+    if (par) {
+        AddMessage(RGY_LOG_DEBUG, _T("AV1: sequence header not found, use codec parameters for AV1 video descriptor.\n"));
+        return gen_av1_video_descriptor(av1SeqHeaderInfoFromCodecPar(par));
     }
     AddMessage(RGY_LOG_WARN, _T("AV1: failed to parse sequence header, use default AV1 video descriptor.\n"));
     return gen_av1_video_descriptor(RGYAV1SeqHeaderInfo());
