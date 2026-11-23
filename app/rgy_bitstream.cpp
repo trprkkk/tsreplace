@@ -918,6 +918,471 @@ std::deque<std::unique_ptr<unit_info>> parse_unit_av1(const uint8_t *data, const
     return list;
 }
 
+// -----------------------------------------------------------------------------------------
+// AV1 in MPEG-2 TS ("Carriage of AV1 in MPEG-2 TS", AOM Working Group Draft) 関連
+// -----------------------------------------------------------------------------------------
+
+static bool av1_start_code_at(const uint8_t *data, size_t size, size_t *sc_len) {
+    if (size >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) {
+        if (sc_len) *sc_len = 4;
+        return true;
+    }
+    if (size >= 3 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01) {
+        if (sc_len) *sc_len = 3;
+        return true;
+    }
+    return false;
+}
+
+// OBU ヘッダ (emulation prevention 除去済みの raw OBU 先頭) を読み、ヘッダ長を返す。先頭が OBU ヘッダでないなら 0。
+static size_t av1_obu_header_len(const uint8_t *data, size_t size, uint8_t *type, uint8_t *has_size_flag, int *temporal_id, int *spatial_id) {
+    if (size < 1) return 0;
+    const uint8_t firstbyte = data[0];
+    const uint8_t obu_type = (firstbyte & 0x78) >> 3;
+    const uint8_t extension_flag = (firstbyte & 0x04) >> 2;
+    const uint8_t obu_has_size_flag = (firstbyte & 0x02) >> 1;
+    if (type) *type = obu_type;
+    if (has_size_flag) *has_size_flag = obu_has_size_flag;
+    if (temporal_id) *temporal_id = 0;
+    if (spatial_id) *spatial_id = 0;
+    size_t header_len = 1;
+    if (extension_flag) {
+        if (size < 2) return 0;
+        const uint8_t byte2 = data[1];
+        if (temporal_id) *temporal_id = (byte2 & 0xE0) >> 5;
+        if (spatial_id) *spatial_id = (byte2 & 0x18) >> 3;
+        header_len = 2;
+    }
+    return header_len;
+}
+
+static uint64_t av1_read_uleb128(const uint8_t *data, size_t size, size_t *read_len) {
+    uint64_t value = 0;
+    size_t i = 0;
+    for (; i < 8 && i < size; i++) {
+        const uint8_t byte = data[i];
+        value |= (uint64_t)(byte & 0x7f) << (i * 7);
+        if ((byte & 0x80) == 0) {
+            i++;
+            break;
+        }
+    }
+    if (read_len) *read_len = i;
+    return value;
+}
+
+std::vector<av1_obu_info> parse_obu_av1(const uint8_t *data, size_t size) {
+    std::vector<av1_obu_info> list;
+    if (data == nullptr || size == 0) return list;
+
+    size_t sc_len = 0;
+    if (av1_start_code_at(data, size, &sc_len)) {
+        // start code 形式 (tsOBU / Annex B): 0x000001 ごとに OBU を区切る
+        static const uint8_t SC[3] = { 0x00, 0x00, 0x01 };
+        const uint8_t *fin = data + size;
+        int64_t i = 0;
+        av1_obu_info obu_start = { nullptr, 0, 0, 0, 0, 0, false };
+        bool has_obu = false;
+        for (;;) {
+            const auto next = rgy_memmem_c((const void *)(data + i), (size_t)(fin - (data + i)), (const void *)SC, sizeof(SC));
+            if (next == RGY_MEMMEM_NOT_FOUND) break;
+            i += next;
+            if (i + 3 > (int64_t)size) break;
+            if (has_obu) {
+                // 前の OBU の範囲は次の start code まで (4byte start code の先頭の 0x00 は start code 側に含める)
+                const int64_t obu_end = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
+                list.push_back(obu_start);
+                auto prev = list.end() - 1;
+                prev->size = (obu_end > (int64_t)(prev->ptr - data)) ? (size_t)(obu_end - (prev->ptr - data)) : 0;
+            }
+            obu_start.ptr = data + i + 3;
+            obu_start.size = (size_t)(fin - obu_start.ptr);
+            obu_start.escaped = true;
+            const size_t hdr_len = av1_obu_header_len(obu_start.ptr, obu_start.size, &obu_start.type, &obu_start.has_size_flag, &obu_start.temporal_id, &obu_start.spatial_id);
+            if (hdr_len == 0) {
+                obu_start.type = 0;
+                obu_start.has_size_flag = 0;
+            }
+            has_obu = true;
+            i += 3;
+        }
+        if (has_obu) {
+            list.push_back(obu_start);
+        }
+        return list;
+    }
+
+    // low overhead 形式: OBU が連続して並ぶ (obu_has_size_field=1 が基本)
+    int64_t size_remain = (int64_t)size;
+    while (size_remain > 0) {
+        av1_obu_info obu;
+        obu.ptr = data;
+        obu.escaped = false;
+        const size_t hdr_len = av1_obu_header_len(data, (size_t)size_remain, &obu.type, &obu.has_size_flag, &obu.temporal_id, &obu.spatial_id);
+        if (hdr_len == 0) break;
+        size_t payload_start = hdr_len;
+        uint64_t obu_size = 0;
+        if (obu.has_size_flag) {
+            size_t uleb_len = 0;
+            obu_size = av1_read_uleb128(data + hdr_len, (size_t)size_remain - hdr_len, &uleb_len);
+            payload_start = hdr_len + uleb_len;
+            obu.size = payload_start + (size_t)obu_size;
+            if (obu.size > (size_t)size_remain) obu.size = (size_t)size_remain; //clamp
+        } else {
+            // obu_size フィールドがない OBU は temporal unit の最後まで
+            obu.size = (size_t)size_remain;
+        }
+        if (obu.size == 0) break;
+        list.push_back(obu);
+        data += obu.size;
+        size_remain -= (int64_t)obu.size;
+    }
+    return list;
+}
+
+std::vector<uint8_t> av1_to_tsobu(const uint8_t *data, size_t size) {
+    std::vector<uint8_t> out;
+    const auto obus = parse_obu_av1(data, size);
+    if (obus.empty()) {
+        // OBU として解釈できない場合はそのまま start code を付けてエスケープする
+        if (data != nullptr && size > 0) {
+            static const uint8_t SC[3] = { 0x00, 0x00, 0x01 };
+            out.insert(out.end(), SC, SC + 3);
+            std::vector<uint8_t> raw(data, data + size);
+            if (raw.size() > 2) to_nal(raw);
+            out.insert(out.end(), raw.begin(), raw.end());
+        }
+        return out;
+    }
+    static const uint8_t SC[3] = { 0x00, 0x00, 0x01 };
+    out.reserve(size + obus.size() * 3 + size / 3 + 16);
+    for (const auto &obu : obus) {
+        out.insert(out.end(), SC, SC + 3);
+        std::vector<uint8_t> raw;
+        if (obu.escaped) {
+            // tsOBU / Annex B から emulation prevention を除去してから付け直す
+            raw = unnal(obu.ptr, obu.size);
+        } else {
+            raw.assign(obu.ptr, obu.ptr + obu.size);
+        }
+        if (raw.size() > 2) {
+            to_nal(raw); // 0x000000/0x000001/0x000002 が現れないよう 0x03 を挿入する
+        }
+        out.insert(out.end(), raw.begin(), raw.end());
+    }
+    return out;
+}
+
+// AV1 シーケンスヘッダのビット列を読むための簡易ビットリーダ
+class RGYAV1BitReader {
+public:
+    RGYAV1BitReader(const uint8_t *data, size_t size) : m_data(data), m_size(size), m_bitpos(0), m_overflow(false) {}
+
+    int getbit() {
+        if (m_bitpos >= m_size * 8) {
+            m_overflow = true;
+            return 0;
+        }
+        const int b = (m_data[m_bitpos / 8] >> (7 - (m_bitpos % 8))) & 1;
+        m_bitpos++;
+        return b;
+    }
+    uint32_t f(int n) {
+        uint32_t v = 0;
+        for (int i = 0; i < n; i++) {
+            v = (v << 1) | (uint32_t)getbit();
+        }
+        return v;
+    }
+    uint32_t ue() { // unsigned exp-Golomb
+        int zeros = 0;
+        while (getbit() == 0) {
+            zeros++;
+            if (zeros >= 32) return 0; //異常
+        }
+        return (zeros > 0) ? ((1u << zeros) - 1 + f(zeros)) : 0;
+    }
+    bool overflow() const { return m_overflow; }
+private:
+    const uint8_t *m_data;
+    size_t m_size;
+    size_t m_bitpos;
+    bool m_overflow;
+};
+
+RGYAV1SeqHeaderInfo::RGYAV1SeqHeaderInfo() :
+    valid(false),
+    seq_profile(0), seq_level_idx_0(0), seq_tier_0(0),
+    high_bitdepth(0), twelve_bit(0), monochrome(0),
+    chroma_subsampling_x(1), chroma_subsampling_y(1), chroma_sample_position(0),
+    color_primaries(2), transfer_characteristics(2), matrix_coefficients(2) {
+}
+
+// sequence_header_obu の内容を解析する (AV1 spec 5.5.2 / 6.4.2)
+// obu は raw OBU (obu_header から、emulation prevention 除去済み)
+bool parse_av1_sequence_header_obu(const uint8_t *obu, size_t size, RGYAV1SeqHeaderInfo &info) {
+    if (obu == nullptr || size == 0) return false;
+    uint8_t type = 0, has_size_flag = 0;
+    int temporal_id = 0, spatial_id = 0;
+    const size_t hdr_len = av1_obu_header_len(obu, size, &type, &has_size_flag, &temporal_id, &spatial_id);
+    if (hdr_len == 0 || type != OBU_SEQUENCE_HEADER) return false;
+    size_t payload_offset = hdr_len;
+    if (has_size_flag) {
+        size_t uleb_len = 0;
+        av1_read_uleb128(obu + hdr_len, size - hdr_len, &uleb_len);
+        payload_offset = hdr_len + uleb_len;
+    }
+    if (payload_offset >= size) return false;
+
+    RGYAV1BitReader br(obu + payload_offset, size - payload_offset);
+    info = RGYAV1SeqHeaderInfo();
+
+    info.seq_profile = (int)br.f(3);
+    br.getbit(); // still_picture
+    const int reduced_still_picture_header = br.getbit();
+
+    int seq_level_idx_0 = 0, seq_tier_0 = 0;
+    int buffer_delay_length_minus1 = 0;
+    bool decoder_model_info_present_flag = false;
+    bool initial_display_delay_present_flag = false;
+    if (reduced_still_picture_header) {
+        // timing_info_present_flag = 0, decoder_model_info_present_flag = 0, operating_points_cnt_minus1 = 0
+        initial_display_delay_present_flag = br.getbit() != 0;
+        seq_level_idx_0 = (int)br.f(5);
+        // reduced_still_picture_header では seq_tier は読まない (常に0)
+        if (initial_display_delay_present_flag) {
+            br.f(4); // initial_display_delay_minus_one[0]
+        }
+    } else {
+        const bool timing_info_present_flag = br.getbit() != 0;
+        if (timing_info_present_flag) {
+            br.f(32); // num_units_in_tick
+            br.f(32); // time_scale
+            if (br.getbit()) { // equal_picture_interval
+                br.ue(); // num_ticks_per_picture_minus1
+            }
+            // decoder_model_info_present_flag は timing_info_present_flag が1のときのみ存在する (AV1 spec 5.5.2)
+            decoder_model_info_present_flag = br.getbit() != 0;
+            if (decoder_model_info_present_flag) {
+                buffer_delay_length_minus1 = (int)br.f(5);
+                br.f(32); // num_units_in_decoding_tick
+                br.f(5);  // buffer_removal_time_length_minus1
+                br.f(5);  // frame_presentation_time_length_minus1
+            }
+        }
+        initial_display_delay_present_flag = br.getbit() != 0;
+        const int operating_points_cnt_minus1 = (int)br.f(5);
+        for (int i = 0; i <= operating_points_cnt_minus1; i++) {
+            br.f(12); // operating_point_idc[i]
+            const int seq_level_idx = (int)br.f(5);
+            int seq_tier = 0;
+            if (seq_level_idx > 7) { // AV1 spec: seq_level_idx > 7 で seq_tier が続く
+                seq_tier = br.getbit();
+            }
+            if (decoder_model_info_present_flag) {
+                br.f(buffer_delay_length_minus1 + 1); // decoder_buffer_delay[i]
+                br.f(buffer_delay_length_minus1 + 1); // encoder_buffer_delay[i]
+                br.getbit(); // low_delay_mode_flag[i]
+            }
+            if (initial_display_delay_present_flag) {
+                if (br.getbit()) { // initial_display_delay_present_for_this_op[i]
+                    br.f(4); // initial_display_delay_minus_one[i]
+                }
+            }
+            if (i == 0) {
+                seq_level_idx_0 = seq_level_idx;
+                seq_tier_0 = seq_tier;
+            }
+        }
+    }
+    info.seq_level_idx_0 = seq_level_idx_0;
+    info.seq_tier_0 = seq_tier_0;
+
+    const int frame_width_bits_minus1 = (int)br.f(4);
+    const int frame_height_bits_minus1 = (int)br.f(4);
+    br.f(frame_width_bits_minus1 + 1);  // max_frame_width_minus1
+    br.f(frame_height_bits_minus1 + 1); // max_frame_height_minus1
+    if (!reduced_still_picture_header) {
+        if (br.getbit()) { // frame_id_numbers_present_flag
+            br.f(4); // delta_frame_id_length_minus2
+            br.f(3); // additional_frame_id_length_minus1
+        }
+    }
+    br.getbit(); // use_128x128_superblock
+    br.getbit(); // enable_filter_intra
+    br.getbit(); // enable_intra_edge_filter
+    if (!reduced_still_picture_header) {
+        br.getbit(); // enable_interintra_compound
+        br.getbit(); // enable_masked_compound
+        br.getbit(); // enable_warped_motion
+        br.getbit(); // enable_dual_filter
+        const int enable_order_hint = br.getbit();
+        if (enable_order_hint) {
+            br.getbit(); // enable_jnt_comp
+            br.getbit(); // enable_ref_frame_mvs
+        }
+        int seq_force_screen_content_tools = 0;
+        if (br.getbit()) { // seq_choose_screen_content_tools
+            seq_force_screen_content_tools = 2; // SELECT_SCREEN_CONTENT_TOOLS
+        } else {
+            seq_force_screen_content_tools = br.getbit();
+        }
+        if (seq_force_screen_content_tools > 0) {
+            if (br.getbit()) { // seq_choose_integer_mv
+                // seq_force_integer_mv = SELECT_INTEGER_MV
+            } else {
+                br.getbit(); // seq_force_integer_mv
+            }
+        }
+        if (enable_order_hint) {
+            br.f(3); // order_hint_bits_minus1
+        }
+    }
+    br.getbit(); // enable_superres
+    br.getbit(); // enable_cdef
+    br.getbit(); // enable_restoration
+
+    // color_config() (AV1 spec 6.4.2)
+    info.high_bitdepth = br.getbit();
+    int bitdepth = info.high_bitdepth ? 10 : 8;
+    if (info.seq_profile == 2 && info.high_bitdepth) {
+        info.twelve_bit = br.getbit();
+        bitdepth = info.twelve_bit ? 12 : 10;
+    } else {
+        info.twelve_bit = 0;
+    }
+    if (info.seq_profile != 1) {
+        info.monochrome = br.getbit();
+    } else {
+        info.monochrome = 0;
+    }
+    const bool color_description_present_flag = br.getbit() != 0;
+    if (color_description_present_flag) {
+        info.color_primaries = (int)br.f(8);
+        info.transfer_characteristics = (int)br.f(8);
+        info.matrix_coefficients = (int)br.f(8);
+    } else {
+        info.color_primaries = 2;   // CP_UNSPECIFIED
+        info.transfer_characteristics = 2; // TC_UNSPECIFIED
+        info.matrix_coefficients = 2;      // MC_UNSPECIFIED
+    }
+    if (info.monochrome) {
+        br.getbit(); // color_range
+        info.chroma_subsampling_x = 1;
+        info.chroma_subsampling_y = 1;
+        info.chroma_sample_position = 0; // CSP_UNKNOWN
+    } else if (info.color_primaries == 1 /*CP_BT_709*/
+        && info.transfer_characteristics == 13 /*TC_SRGB*/
+        && info.matrix_coefficients == 0 /*MC_IDENTITY*/) {
+        info.chroma_subsampling_x = 0;
+        info.chroma_subsampling_y = 0;
+        info.chroma_sample_position = 0;
+    } else {
+        br.getbit(); // color_range
+        if (info.seq_profile == 0) {
+            info.chroma_subsampling_x = 1;
+            info.chroma_subsampling_y = 1;
+        } else if (info.seq_profile == 1) {
+            info.chroma_subsampling_x = 0;
+            info.chroma_subsampling_y = 0;
+        } else { // seq_profile == 2
+            if (bitdepth == 12) {
+                info.chroma_subsampling_x = br.getbit();
+                if (info.chroma_subsampling_x) {
+                    info.chroma_subsampling_y = br.getbit();
+                } else {
+                    info.chroma_subsampling_y = 0;
+                }
+            } else {
+                info.chroma_subsampling_x = 1;
+                info.chroma_subsampling_y = 0;
+            }
+        }
+        if (info.chroma_subsampling_x && info.chroma_subsampling_y) {
+            info.chroma_sample_position = (int)br.f(2);
+        } else {
+            info.chroma_sample_position = 0;
+        }
+    }
+
+    if (br.overflow()) {
+        return false;
+    }
+    info.valid = true;
+    return true;
+}
+
+bool find_av1_sequence_header(const uint8_t *data, size_t size, RGYAV1SeqHeaderInfo &info) {
+    const auto obus = parse_obu_av1(data, size);
+    for (const auto &obu : obus) {
+        std::vector<uint8_t> raw;
+        const uint8_t *ptr = obu.ptr;
+        size_t len = obu.size;
+        if (obu.escaped) {
+            raw = unnal(obu.ptr, obu.size);
+            ptr = raw.data();
+            len = raw.size();
+        }
+        if (parse_av1_sequence_header_obu(ptr, len, info)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool parse_av1_codec_config_record(const uint8_t *data, size_t size, RGYAV1SeqHeaderInfo &info) {
+    if (data == nullptr || size < 4) return false;
+    if ((data[0] & 0x80) == 0 || (data[0] & 0x7f) != 1) return false; // marker=1, version=1
+    info = RGYAV1SeqHeaderInfo();
+    info.valid = true;
+    info.seq_profile = (data[1] >> 5) & 0x07;
+    info.seq_level_idx_0 = data[1] & 0x1f;
+    info.seq_tier_0 = (data[2] >> 7) & 1;
+    info.high_bitdepth = (data[2] >> 6) & 1;
+    info.twelve_bit = (data[2] >> 5) & 1;
+    info.monochrome = (data[2] >> 4) & 1;
+    info.chroma_subsampling_x = (data[2] >> 3) & 1;
+    info.chroma_subsampling_y = (data[2] >> 2) & 1;
+    info.chroma_sample_position = data[2] & 0x03;
+    // av1C には color description がないので unspecified
+    info.color_primaries = 2;
+    info.transfer_characteristics = 2;
+    info.matrix_coefficients = 2;
+    return true;
+}
+
+std::vector<uint8_t> gen_av1_video_descriptor(const RGYAV1SeqHeaderInfo &info) {
+    // hdr_wcg_idc: 0=SDR(BT.709), 1=WCG only, 2=HDR+WCG, 3=no indication
+    int hdr_wcg_idc = 3;
+    if (info.valid) {
+        const bool wcg = info.color_primaries == 9 /*CP_BT_2020*/;
+        const bool hdr = info.transfer_characteristics == 16 /*TC_SMPTE2084(PQ)*/
+            || info.transfer_characteristics == 18 /*TC_ARIB_STD_B67(HLG)*/;
+        if (hdr && wcg) {
+            hdr_wcg_idc = 2;
+        } else if (wcg) {
+            hdr_wcg_idc = 1;
+        } else if (info.color_primaries == 1 /*CP_BT_709*/ && info.transfer_characteristics == 1 /*TC_BT_709*/) {
+            hdr_wcg_idc = 0;
+        }
+    }
+    std::vector<uint8_t> desc;
+    desc.push_back((uint8_t)0x80); // descriptor_tag (AV1 video descriptor)
+    desc.push_back(0x04);          // descriptor_length
+    desc.push_back((uint8_t)(0x80 | 0x01)); // marker=1, version=1
+    desc.push_back((uint8_t)(((info.seq_profile & 0x07) << 5) | (info.seq_level_idx_0 & 0x1f)));
+    desc.push_back((uint8_t)(
+        ((info.seq_tier_0 & 0x01) << 7)
+        | ((info.high_bitdepth & 0x01) << 6)
+        | ((info.twelve_bit & 0x01) << 5)
+        | ((info.monochrome & 0x01) << 4)
+        | ((info.chroma_subsampling_x & 0x01) << 3)
+        | ((info.chroma_subsampling_y & 0x01) << 2)
+        | (info.chroma_sample_position & 0x03)));
+    desc.push_back((uint8_t)(((hdr_wcg_idc & 0x03) << 5) | 0x00)); // hdr_wcg_idc, reserved_zeros, initial_presentation_delay_present=0, reserved
+    return desc;
+}
+
 #if 0
 
 

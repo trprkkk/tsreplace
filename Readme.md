@@ -41,6 +41,8 @@ tsreplaceを使用するには、コマンドラインから直接使用する�
 
 `tsreplace.exe -i <入力tsファイル> -r <置き換え映像ファイル> -o <出力tsファイル>`
 
+置き換え映像のコーデックは MPEG-2 / H.264 / HEVC / AV1 に対応しています。AV1で置き換える場合、["Carriage of AV1 in MPEG-2 TS"](https://aomediacodec.github.io/av1-mpeg2-ts/) (AOM Working Group Draft) に従い、PMTには stream_type 0x06 + registration descriptor 'AV01' + AV1 video descriptor を記載し、PESは private_stream_1 (stream_id 0xBD) で ts_open_bitstream_unit 形式のペイロードを運びます。
+
 ## エンコードしながら置き換える
 下記のように、2段階に分けずエンコードしながら置き換えを行うこともできます。
 
@@ -202,6 +204,8 @@ cut 7060000000 -1
 置き換える映像の入っているファイルのパス。"-"で標準入力になります。
 
 timestampを保持できるコンテナ入りの映像を想定しており、raw ES等は考慮しません。また、```-e```, ```--encoder```との併用はできません。
+
+映像コーデックは MPEG-2 / H.264 / HEVC / AV1 に対応しています (AV1は "Carriage of AV1 in MPEG-2 TS" ドラフト準拠でTSに多重化されます)。
 
 ### -e, --encoder &lt;string&gt; [&lt;string&gt;]...
 ```-r```を指定する代わりに、指定のエンコーダを起動してエンコーダを行います。```-r```との併用はできません。

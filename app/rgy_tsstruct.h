@@ -167,7 +167,9 @@ struct RGYTS_PAT {
     RGYTS_PSI psi;
 };
 
-enum class RGYTSStreamType : uint8_t {
+// AV1_VIDEO は内部表現上の sentinel (実際の stream_type は 0x06 + registration descriptor 'AV01')。
+// "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 参照。
+enum class RGYTSStreamType : uint16_t {
     UNKNOWN          = 0x00,
     H262_VIDEO       = 0x02,
     H264_VIDEO       = 0x1b,
@@ -176,7 +178,29 @@ enum class RGYTSStreamType : uint8_t {
     ADTS_TRANSPORT   = 0x0f,
     PES_PRIVATE_DATA = 0x06,
     TYPE_D           = 0x0D,
+    AV1_VIDEO        = 0x0106, // stream_type 0x06 + registration descriptor 'AV01' + AV1 video descriptor
 };
+
+static inline bool rgyTSStreamTypeIsVideo(RGYTSStreamType type) {
+    return type == RGYTSStreamType::H262_VIDEO
+        || type == RGYTSStreamType::H264_VIDEO
+        || type == RGYTSStreamType::H265_VIDEO
+        || type == RGYTSStreamType::AV1_VIDEO;
+}
+
+// PMT の ES記述子ループから AV1 の registration descriptor ('AV01') を探す
+static inline bool rgyTSESInfoHasAV1Registration(const uint8_t *desc, int descLen) {
+    if (desc == nullptr) return false;
+    for (int i = 0; i + 2 <= descLen; i += 2 + desc[i + 1]) {
+        // registration_descriptor (tag 0x05), format_identifier 'AV01'
+        if (desc[i] == 0x05 && desc[i + 1] >= 4
+            && i + 2 + 4 <= descLen
+            && desc[i + 2] == 'A' && desc[i + 3] == 'V' && desc[i + 4] == '0' && desc[i + 5] == '1') {
+            return true;
+        }
+    }
+    return false;
+}
 
 
 struct RGYTSStreamInfo {

@@ -270,7 +270,11 @@ void RGYTSDemuxer::parsePMT(RGYTSDemuxProgram *program) {
         const auto streamType = (RGYTSStreamType)table[pos];
         const int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
         const int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
-        RGYTSStreamInfo streamInfo = { streamType, esPid };
+        // "Carriage of AV1 in MPEG-2 TS" では stream_type 0x06 + registration descriptor 'AV01' がAV1映像を示す
+        const bool isAV1Video = streamType == RGYTSStreamType::PES_PRIVATE_DATA
+            && pos + 5 + esInfoLength <= tableLen
+            && rgyTSESInfoHasAV1Registration(table + pos + 5, esInfoLength);
+        RGYTSStreamInfo streamInfo = { isAV1Video ? RGYTSStreamType::AV1_VIDEO : streamType, esPid };
         service.pidList.push_back(streamInfo);
         if (pos + 5 + esInfoLength <= tableLen) {
             int componentTag = 0xff;
@@ -281,7 +285,13 @@ void RGYTSDemuxer::parsePMT(RGYTSDemuxProgram *program) {
                     break;
                 }
             }
-            if (streamType == RGYTSStreamType::H262_VIDEO ||
+            if (isAV1Video) {
+                if (service.vid.stream.pid == 0 || componentTag == 0x00) {
+                    service.vid.stream.pid = esPid;
+                    service.vid.stream.type = RGYTSStreamType::AV1_VIDEO;
+                    videoDescPos = pos;
+                }
+            } else if (streamType == RGYTSStreamType::H262_VIDEO ||
                 streamType == RGYTSStreamType::H264_VIDEO ||
                 streamType == RGYTSStreamType::H265_VIDEO) {
                 if ((service.vid.stream.pid == 0 && componentTag == 0xff) || componentTag == 0x00 || componentTag == 0x81) {

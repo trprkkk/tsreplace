@@ -39,6 +39,8 @@
 int findsync(const uint8_t *data, const int data_size, int *unit_size);
 
 enum class RGYTSDescriptor : uint8_t {
+    Registration               = 0x05,
+    AV1Video                   = 0x80,
     ConditionalAccess          = 0x09,
     NetworkName                = 0x40,
     ServiceList                = 0x41,

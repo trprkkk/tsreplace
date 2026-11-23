@@ -272,6 +272,32 @@ tsdemux_test = executable('rgy_tsdemux_test',
 
 test('rgy_tsdemux', tsdemux_test)
 
+av1ts_test_deps = [threads_dep, dl_dep, m_dep]
+if stdcxxfs_dep.found()
+  av1ts_test_deps += stdcxxfs_dep
+endif
+
+av1ts_test = executable('rgy_av1ts_test',
+  files(
+    'app/rgy_av1ts_test.cpp',
+    'app/rgy_bitstream.cpp',
+    'app/rgy_memmem.cpp',
+    'app/rgy_simd.cpp',
+    'app/rgy_tsdemux.cpp',
+    'app/rgy_tsstruct.cpp',
+    'app/rgy_tsutil.cpp',
+    'app/rgy_util.cpp',
+    'app/rgy_codepage.cpp',
+  ),
+  cpp_args: common_cpp_args,
+  include_directories: common_include_dirs,
+  dependencies: av1ts_test_deps,
+  link_args: static_runtime_link_args,
+  link_with: simd_libs,
+)
+
+test('rgy_av1ts', av1ts_test)
+
 summary({
   'FFmpeg static deps': libav_static,
   'Static runtime': static_runtime,

@@ -139,6 +139,10 @@ public:
     const uint8_t *getExtraData(int& size) const;
     const AVCodecParameters *getVidCodecPar() const;
     AVCodecID getVidCodecID() const;
+    // AV1 video descriptor (PMT 用, descriptor_tag 0x80) を生成する (AV1 の場合のみ有効)
+    std::vector<uint8_t> genAV1VideoDescriptor();
+    // sequence header OBU を tsOBU 形式 (start code + emulation prevention) で取得する (AV1 の場合のみ有効)
+    std::vector<uint8_t> getAV1HeaderTsObu();
     AVRational getVidTimebase() const;
     int64_t getFirstKeyPts() const;
     RGY_ERR fillPackets();

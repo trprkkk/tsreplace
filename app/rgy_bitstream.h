@@ -237,6 +237,55 @@ decltype(find_header_c)* get_find_header_func();
 
 std::deque<std::unique_ptr<unit_info>> parse_unit_av1(const uint8_t *data, const size_t size);
 
+// AV1 の OBU 1つ分の情報 (emulation prevention byte は escaped==true の場合のみ含まれる)
+struct av1_obu_info {
+    const uint8_t *ptr;   // OBU の先頭 (obu_header) へのポインタ
+    size_t size;          // OBU の範囲の長さ (start code は含まない)
+    uint8_t type;         // obu_type
+    uint8_t has_size_flag;
+    int temporal_id;
+    int spatial_id;
+    bool escaped;         // start code 形式 (tsOBU / Annex B) から取り出した場合 true (emulation prevention 込み)
+};
+
+// AV1 ビットストリームを OBU ごとに分解する。
+// data は low overhead 形式 (start code なし) または start code 形式 (0x000001 + emulation prevention) を受け付ける。
+std::vector<av1_obu_info> parse_obu_av1(const uint8_t *data, size_t size);
+
+// AV1 ビットストリームを MPEG-2 TS 搬送用の ts_open_bitstream_unit 形式
+// (各 OBU の前に 0x000001 を付け、payload 内の 0x000000/0x000001/0x000002 を emulation prevention する) に変換する。
+// "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 3.2 章参照。
+std::vector<uint8_t> av1_to_tsobu(const uint8_t *data, size_t size);
+
+struct RGYAV1SeqHeaderInfo {
+    bool valid;
+    int seq_profile;
+    int seq_level_idx_0;
+    int seq_tier_0;
+    int high_bitdepth;
+    int twelve_bit;
+    int monochrome;
+    int chroma_subsampling_x;
+    int chroma_subsampling_y;
+    int chroma_sample_position;
+    int color_primaries;
+    int transfer_characteristics;
+    int matrix_coefficients;
+    RGYAV1SeqHeaderInfo();
+};
+
+// 1つの raw OBU (emulation prevention 除去済み) が sequence_header_obu なら内容を解析する
+bool parse_av1_sequence_header_obu(const uint8_t *obu, size_t size, RGYAV1SeqHeaderInfo &info);
+
+// ストリーム中の最初の sequence_header_obu を探して解析する (low overhead / start code 形式どちらでも可)
+bool find_av1_sequence_header(const uint8_t *data, size_t size, RGYAV1SeqHeaderInfo &info);
+
+// AV1CodecConfigurationRecord (av1C, 先頭4byte) からパラメータを読み取る
+bool parse_av1_codec_config_record(const uint8_t *data, size_t size, RGYAV1SeqHeaderInfo &info);
+
+// AV1 video descriptor (descriptor_tag 0x80, descriptor_length 4) を生成する
+std::vector<uint8_t> gen_av1_video_descriptor(const RGYAV1SeqHeaderInfo &info);
+
 uint8_t gen_obu_header(const uint8_t obu_type);
 size_t get_av1_uleb_size_bytes(uint64_t value);
 std::vector<uint8_t> get_av1_uleb_size_data(uint64_t value);

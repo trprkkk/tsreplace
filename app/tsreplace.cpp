@@ -440,6 +440,56 @@ AVCodecID TSReplaceVideo::getVidCodecID() const {
     return AV_CODEC_ID_NONE;
 }
 
+std::vector<uint8_t> TSReplaceVideo::genAV1VideoDescriptor() {
+    RGYAV1SeqHeaderInfo info;
+    // まず extradata 中の sequence header OBU を試す (color 情報も取れる)
+    if (m_Demux.video.extradata && m_Demux.video.extradataSize > 0
+        && find_av1_sequence_header(m_Demux.video.extradata, m_Demux.video.extradataSize, info)) {
+        return gen_av1_video_descriptor(info);
+    }
+    // extradata の av1C (AV1CodecConfigurationRecord, 先頭4byte) を試す
+    if (m_Demux.video.extradata && m_Demux.video.extradataSize >= 4
+        && parse_av1_codec_config_record(m_Demux.video.extradata, m_Demux.video.extradataSize, info)) {
+        return gen_av1_video_descriptor(info);
+    }
+    // 最初のパケットから探す
+    if (m_Demux.video.firstPkt && m_Demux.video.firstPkt->data && m_Demux.video.firstPkt->size > 0
+        && find_av1_sequence_header(m_Demux.video.firstPkt->data, m_Demux.video.firstPkt->size, info)) {
+        return gen_av1_video_descriptor(info);
+    }
+    AddMessage(RGY_LOG_WARN, _T("AV1: failed to parse sequence header, use default AV1 video descriptor.\n"));
+    return gen_av1_video_descriptor(RGYAV1SeqHeaderInfo());
+}
+
+std::vector<uint8_t> TSReplaceVideo::getAV1HeaderTsObu() {
+    // extradata / firstPkt から sequence header OBU を探し、tsOBU 形式に変換して返す
+    const uint8_t *searchData[2] = { m_Demux.video.extradata, (m_Demux.video.firstPkt) ? m_Demux.video.firstPkt->data : nullptr };
+    const int searchSize[2] = { m_Demux.video.extradataSize, (m_Demux.video.firstPkt) ? m_Demux.video.firstPkt->size : 0 };
+    for (int i = 0; i < 2; i++) {
+        if (searchData[i] == nullptr || searchSize[i] <= 0) continue;
+        const uint8_t *data = searchData[i];
+        size_t size = searchSize[i];
+        // av1C (marker=1, version=1) が先頭にある場合は 4byte スキップ
+        if (size >= 4 && (data[0] & 0x80) != 0 && (data[0] & 0x7f) == 1) {
+            data += 4;
+            size -= 4;
+        }
+        const auto obus = parse_obu_av1(data, size);
+        for (const auto &obu : obus) {
+            if (obu.type == OBU_SEQUENCE_HEADER) {
+                std::vector<uint8_t> raw;
+                if (obu.escaped) {
+                    raw = unnal(obu.ptr, obu.size);
+                } else {
+                    raw.assign(obu.ptr, obu.ptr + obu.size);
+                }
+                return av1_to_tsobu(raw.data(), raw.size());
+            }
+        }
+    }
+    return {};
+}
+
 RGYTSStreamType TSReplaceVideo::getVideoStreamType() const {
     if (m_Demux.video.stream) {
         switch (m_Demux.video.stream->codecpar->codec_id) {
@@ -449,6 +499,8 @@ RGYTSStreamType TSReplaceVideo::getVideoStreamType() const {
             return RGYTSStreamType::H264_VIDEO;
         case AV_CODEC_ID_HEVC:
             return RGYTSStreamType::H265_VIDEO;
+        case AV_CODEC_ID_AV1:
+            return RGYTSStreamType::AV1_VIDEO;
         default:
             return RGYTSStreamType::UNKNOWN;
         }
@@ -1796,20 +1848,54 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
     }
 
     const int tableLen = 3 + psi->section_length - 4/*CRC32*/;
+    const auto targetService = m_demuxer->service();
+    const int targetVidPid = (targetService) ? targetService->vid.stream.pid : 0;
     while (pos + 4 < tableLen) {
         const auto streamType = (RGYTSStreamType)table[pos];
         const int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
         const int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
-        
-        if (streamType == RGYTSStreamType::H262_VIDEO) {
-            buf.push_back((uint8_t)m_videoReplace->getVideoStreamType());     // stream typeの上書き
-            buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
-            buf.push_back((uint8_t) (m_vidPIDReplace & 0x00ff));                                 // PIDの上書き
-            buf.push_back(0xf0);
-            buf.push_back(0x03);
-            buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
-            buf.push_back(0x01);
-            buf.push_back(0x00);
+        // 入力が AV1 の場合 (stream_type 0x06 + registration descriptor 'AV01') も映像エントリとして扱う
+        const bool isAV1Entry = streamType == RGYTSStreamType::PES_PRIVATE_DATA
+            && pos + 5 + esInfoLength <= tableLen
+            && rgyTSESInfoHasAV1Registration(table + pos + 5, esInfoLength);
+        const bool isVideoEntry = rgyTSStreamTypeIsVideo(streamType) || isAV1Entry
+            || (targetVidPid != 0 && esPid == targetVidPid && streamType == RGYTSStreamType::PES_PRIVATE_DATA);
+        const auto replaceStreamType = m_videoReplace->getVideoStreamType();
+        // 従来は H262 映像のみ書き換えていたが、AV1 入力 or AV1 への置き換えでは
+        // stream_type 0x06 + 'AV01' registration descriptor への書き換えが必要なため、映像エントリも対象にする
+        const bool rewriteVideoEntry = isVideoEntry
+            && (isAV1Entry || replaceStreamType == RGYTSStreamType::AV1_VIDEO || streamType == RGYTSStreamType::H262_VIDEO);
+
+        if (rewriteVideoEntry) {
+            if (replaceStreamType == RGYTSStreamType::AV1_VIDEO) {
+                // "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 2 章:
+                // stream_type は 0x06、ESディスクリプタループの先頭に registration descriptor 'AV01' (0x05)、
+                // 次いで AV1 video descriptor (0x80) を置く
+                std::vector<uint8_t> desc;
+                desc.push_back((uint8_t)RGYTSDescriptor::Registration);
+                desc.push_back(0x04);
+                desc.push_back('A'); desc.push_back('V'); desc.push_back('0'); desc.push_back('1');
+                const auto av1VideoDesc = m_videoReplace->genAV1VideoDescriptor();
+                desc.insert(desc.end(), av1VideoDesc.begin(), av1VideoDesc.end());
+                desc.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
+                desc.push_back(0x01);
+                desc.push_back(0x00);
+                buf.push_back((uint8_t)RGYTSStreamType::PES_PRIVATE_DATA);       // stream type 0x06 の上書き
+                buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
+                buf.push_back((uint8_t) (m_vidPIDReplace & 0x00ff));                                 // PIDの上書き
+                buf.push_back((uint8_t)(0xf0 | ((desc.size() >> 8) & 0x03)));
+                buf.push_back((uint8_t)(desc.size() & 0xff));
+                buf.insert(buf.end(), desc.begin(), desc.end());
+            } else {
+                buf.push_back((uint8_t)replaceStreamType);                        // stream typeの上書き
+                buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
+                buf.push_back((uint8_t) (m_vidPIDReplace & 0x00ff));                                 // PIDの上書き
+                buf.push_back(0xf0);
+                buf.push_back(0x03);
+                buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
+                buf.push_back(0x01);
+                buf.push_back(0x00);
+            }
         } else if (m_removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
         } else {
@@ -1927,6 +2013,12 @@ std::tuple<RGY_ERR, bool, bool> TSReplace::checkPacket(const AVPacket *pkt) {
         const auto hevc_pps_nal = std::find_if(nal_list.begin(), nal_list.end(), [](nal_info info) { return info.type == NALU_HEVC_PPS; });
         const bool header_check = (nal_list.end() != hevc_vps_nal) && (nal_list.end() != hevc_sps_nal) && (nal_list.end() != hevc_pps_nal);
         return { RGY_ERR_NONE, hevc_aud_nal != nal_list.end(), header_check };
+    } else if (m_videoReplace->getVidCodecID() == AV_CODEC_ID_AV1) {
+        // AV1 には AUD は存在しない (temporal delimiter は任意)。sequence header OBU の有無を確認する。
+        const auto obu_list = parse_obu_av1(pkt->data, pkt->size);
+        const auto seq_obu = std::find_if(obu_list.begin(), obu_list.end(), [](const av1_obu_info &info) { return info.type == OBU_SEQUENCE_HEADER; });
+        const bool header_check = seq_obu != obu_list.end();
+        return { RGY_ERR_NONE, false, header_check };
     }
     AddMessage(RGY_LOG_ERROR, _T("Unsupported codec %s!\n"), char_to_tstring(avcodec_get_name(m_videoReplace->getVidCodecID())).c_str());
     return { RGY_ERR_UNSUPPORTED, false, false };
@@ -1943,7 +2035,9 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
     }
     const bool replaceToHEVC = m_videoReplace->getVidCodecID() == AV_CODEC_ID_HEVC;
     const bool replaceToMPEG2 = m_videoReplace->getVidCodecID() == AV_CODEC_ID_MPEG2VIDEO;
-    const bool addAud = m_addAud && !replaceToMPEG2 && !has_aud;
+    const bool replaceToAV1 = m_videoReplace->getVidCodecID() == AV_CODEC_ID_AV1;
+    // AV1 には AUD は存在しない (temporal delimiter は任意) ので挿入しない
+    const bool addAud = m_addAud && !replaceToMPEG2 && !replaceToAV1 && !has_aud;
     const bool addHeader = m_addHeaders && isKey && !has_header;
     // 置換映像のtimecodeはカット済みの出力時間軸なので、mapToOutput()を適用すると二重にカットされる。
     const auto pts = av_rescale_q(avpkt->pts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestampOut;
@@ -1957,7 +2051,7 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
     int add_aud_len = (addAud) ? ((replaceToHEVC) ? 7 : 6) : 0;
     const  uint8_t *header = nullptr;
     int add_header_len = 0;
-    if (addHeader) {
+    if (addHeader && !replaceToAV1) {
         header = m_videoReplace->getExtraData(add_header_len);
         if (!header) {
             AddMessage(RGY_LOG_ERROR, _T("Failed to get header!\n"));
@@ -1965,12 +2059,34 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
         }
     }
 
+    // AV1 の場合、PES ペイロードは ts_open_bitstream_unit 形式 (start code + emulation prevention) が必要。
+    // "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 3.2 章参照。
+    // またキーフレームで sequence header がなければ、先頭に sequence header OBU を付加する。
+    std::vector<uint8_t> av1Payload;
+    const uint8_t *payload = avpkt->data;
+    int payloadSize = avpkt->size;
+    if (replaceToAV1) {
+        if (addHeader) {
+            av1Payload = m_videoReplace->getAV1HeaderTsObu();
+            if (av1Payload.empty()) {
+                AddMessage(RGY_LOG_WARN, _T("AV1: failed to get sequence header OBU, skip adding header.\n"));
+            }
+        }
+        vector_cat(av1Payload, av1_to_tsobu(avpkt->data, avpkt->size));
+        payload = av1Payload.data();
+        payloadSize = (int)av1Payload.size();
+    }
+    // AV1 は private_stream_1 (stream_id 0xBD) で運ぶ (同仕様書 3.4 章)
+    const uint8_t streamID = replaceToAV1 ? 0xbd : vidStreamID;
+
     RGYTSPacket pkt;
     pkt.packet.reserve(188);
-    for (int i = 0; i < avpkt->size; ) {
+    for (int i = 0; i < payloadSize; ) {
         const int pes_header_len = (i > 0) ? 0 : (14 + (addDts ? 5 : 0));
-        const int min_adaption_len = (false /*無効化*/ && i == 0 && isKey) ? 2 : 0;
-        int len = std::min(184 - min_adaption_len, avpkt->size + pes_header_len + add_aud_len + add_header_len - i);
+        // AV1 のキーフレームでは、AU 先頭パケットの adaptation field に random_access_indicator と
+        // elementary_stream_priority_indicator を立てる (同仕様書 3.4 章)
+        const int min_adaption_len = (replaceToAV1 && i == 0 && isKey) ? 2 : 0;
+        int len = std::min(184 - min_adaption_len, payloadSize + pes_header_len + add_aud_len + add_header_len - i);
         if (pes_header_len + add_aud_len + add_header_len + min_adaption_len > 184) {
             AddMessage(RGY_LOG_ERROR, _T("Header size %d is too long, unsupported!\n"), add_header_len);
             return RGY_ERR_UNSUPPORTED;
@@ -1985,17 +2101,18 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
         if (len < 184) {
             pkt.packet.push_back((uint8_t)(183 - len));
             if (len < 183) {
-                pkt.packet.push_back((i == 0 && isKey) ? 0x40 : 0x00);
+                // random_access_indicator (0x40) / AV1 ではさらに elementary_stream_priority_indicator (0x20)
+                pkt.packet.push_back((i == 0 && isKey) ? (replaceToAV1 ? 0x60 : 0x40) : 0x00);
                 pkt.packet.insert(pkt.packet.end(), 182 - len, 0xff);
             }
         }
         if (pes_header_len > 0) {
             static uint8_t PES_START_CODE[3] = { 0x00, 0x00, 0x01 };
             pkt.packet.insert(pkt.packet.end(), PES_START_CODE, PES_START_CODE + sizeof(PES_START_CODE));
-            pkt.packet.push_back(vidStreamID); // stream id
+            pkt.packet.push_back(streamID); // stream id
             pkt.packet.push_back(0);
             pkt.packet.push_back(0);
-            pkt.packet.push_back(0x80);
+            pkt.packet.push_back(replaceToAV1 ? 0x84 : 0x80); // AV1 では data_alignment_indicator=1 (同仕様書 3.4 章)
             pkt.packet.push_back(addDts ? (0x80 | 0x40) : 0x80);
             pkt.packet.push_back(addDts ? 10 : 5); // pes_header_len
             if (addDts) {
@@ -2020,7 +2137,7 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
             pkt.packet.insert(pkt.packet.end(), header, header + add_header_len);
         }
 
-        pkt.packet.insert(pkt.packet.end(), avpkt->data + i, avpkt->data + i + len - pes_header_len - add_aud_len - add_header_len);
+        pkt.packet.insert(pkt.packet.end(), payload + i, payload + i + len - pes_header_len - add_aud_len - add_header_len);
         i += (len - pes_header_len - add_aud_len - add_header_len);
         add_aud_len = 0;
         add_header_len = 0;
