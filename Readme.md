@@ -4,7 +4,11 @@ by rigaya
 
 tsの映像部分のみの置き換えを行い、サイズの圧縮を図るツールです。音声含め、他のパケットはそのままコピーします。
 
-<img src="./data/tsreplace_concept.webp" width="800px">
+## [ダウンロードはこちら](https://github.com/trprkkk/tsreplace/releases)
+
+本フォークでは、rigaya/tsreplace 0.23 をベースに AV1 in MPEG-2 TS 対応を追加しています。Windows x64 ビルド (FFmpeg DLL 同梱) をリリースで配布しています。
+
+<img src="https://raw.githubusercontent.com/trprkkk/tsreplace/main/data/tsreplace_concept.webp" width="800px">
 
 ## 目次 <!-- omit in toc -->
 - [想定動作環境](#想定動作環境)
