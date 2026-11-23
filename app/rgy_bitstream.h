@@ -257,6 +257,19 @@ std::vector<av1_obu_info> parse_obu_av1(const uint8_t *data, size_t size);
 // "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 3.2 章参照。
 std::vector<uint8_t> av1_to_tsobu(const uint8_t *data, size_t size);
 
+// AV1 ビットストリームを low overhead 形式 (start code なし) に変換する。
+// start code 形式の入力は emulation prevention を除去して OBU 列に戻し、
+// obu_has_size_field を持たない OBU には obu_size (leb128) を付与して、
+// 全 OBU が obu_size を持つ形にそろえる (MPC-BE 1.8.5 以降の内蔵 MpegSplitter 等、
+// 素の OBU 列を直接解釈するデマルチプレクサ向け)。
+std::vector<uint8_t> av1_to_low_overhead(const uint8_t *data, size_t size);
+
+// low overhead 形式の temporal unit の先頭に temporal delimiter OBU がない場合に付与する。
+// MP4 等から取り出した AU は temporal delimiter を含まないことがあるが、
+// raw OBU 列を temporal unit 単位で解釈するデマルチプレクサ (FFmpeg の av1_frame_merge 等) は
+// temporal delimiter を要求するため、mpc 形式では AU ごとに付与する。
+void av1_ensure_temporal_delimiter(std::vector<uint8_t> &data);
+
 struct RGYAV1SeqHeaderInfo {
     bool valid;
     int seq_profile;

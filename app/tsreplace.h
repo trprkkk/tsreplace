@@ -53,6 +53,18 @@ static const CX_DESC list_startpoint[] = {
     { nullptr, 0 }
 };
 
+// AV1 置き換え時の PES ペイロード形式
+enum class TSRReplaceAV1Format {
+    Spec, // "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 準拠: tsOBU (start code + emulation prevention)
+    Mpc,  // low overhead OBU 列そのまま (全 OBU に obu_size を付与): MPC-BE 1.8.5 以降の内蔵 MpegSplitter 等向け
+};
+
+static const CX_DESC list_av1_format[] = {
+    { _T("spec"), (int)TSRReplaceAV1Format::Spec },
+    { _T("mpc"),  (int)TSRReplaceAV1Format::Mpc },
+    { nullptr, 0 }
+};
+
 
 enum RGYPktFlags : uint32_t {
     RGY_FLAG_PICT_TYPE_I     = 0x0001000,
@@ -143,6 +155,8 @@ public:
     std::vector<uint8_t> genAV1VideoDescriptor();
     // sequence header OBU を tsOBU 形式 (start code + emulation prevention) で取得する (AV1 の場合のみ有効)
     std::vector<uint8_t> getAV1HeaderTsObu();
+    // sequence header OBU を low overhead 形式 (start code なし、全 OBU に obu_size) で取得する (AV1 の場合のみ有効)
+    std::vector<uint8_t> getAV1HeaderRawObu();
     AVRational getVidTimebase() const;
     int64_t getFirstKeyPts() const;
     RGY_ERR fillPackets();
@@ -215,6 +229,7 @@ struct TSRReplaceParams {
     std::vector<tstring> encoderArgs;
     bool addAud;
     bool addHeaders;
+    TSRReplaceAV1Format av1Format;
     int startupPrerollMs;
     bool removeTypeD;
     bool removeTypeDExplicitlyDisabled;
@@ -371,6 +386,7 @@ protected:
     int64_t m_ptswrapOffset; // PCR wrapの加算分
     bool m_addAud; // audの挿入
     bool m_addHeaders; // ヘッダの挿入
+    TSRReplaceAV1Format m_av1Format; // AV1 置き換え時の PES ペイロード形式
     bool m_removeTypeD; // データの削除
     bool m_removeNonTargetService; // 非対象serviceの削除
     int m_selectService; // 出力するserviceの番号

@@ -180,6 +180,7 @@ TSRReplaceParams::TSRReplaceParams() :
     eofCutDelayMs(100),
     addAud(true),
     addHeaders(true),
+    av1Format(TSRReplaceAV1Format::Spec),
     startupPrerollMs(TSR_STARTUP_PREROLL_DEFAULT_MS),
     removeTypeD(false),
     removeTypeDExplicitlyDisabled(false),
@@ -554,6 +555,17 @@ std::vector<uint8_t> TSReplaceVideo::getAV1HeaderTsObu() {
         }
     }
     return {};
+}
+
+std::vector<uint8_t> TSReplaceVideo::getAV1HeaderRawObu() {
+    // sequence header OBU を low overhead 形式で取得する。
+    // 既存の tsOBU 取得経路を再利用し、av1_to_low_overhead で start code と
+    // emulation prevention を取り除いて obu_size 付きの OBU 列に戻す。
+    const auto tsobu = getAV1HeaderTsObu();
+    if (tsobu.empty()) {
+        return {};
+    }
+    return av1_to_low_overhead(tsobu.data(), tsobu.size());
 }
 
 RGYTSStreamType TSReplaceVideo::getVideoStreamType() const {
@@ -1154,6 +1166,7 @@ TSReplace::TSReplace() :
     m_ptswrapOffset(0),
     m_addAud(true),
     m_addHeaders(true),
+    m_av1Format(TSRReplaceAV1Format::Spec),
     m_removeTypeD(false),
     m_removeNonTargetService(true),
     m_selectService(0),
@@ -1275,6 +1288,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_replaceDelay = prms.replaceDelay;
     m_addAud = prms.addAud;
     m_addHeaders = prms.addHeaders;
+    m_av1Format = prms.av1Format;
     m_startupPrerollMs = prms.startupPrerollMs;
     m_removeTypeD = prms.removeTypeD;
     m_selectService = prms.selectService;
@@ -1344,6 +1358,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
         m_endAtReplaceEOF ? _T("on") : _T("off"), m_eofCutDelayMs);
     AddMessage(RGY_LOG_INFO, _T("Add AUD     : %s.\n"), m_addAud ? _T("on") : _T("off"));
     AddMessage(RGY_LOG_INFO, _T("Add Headers : %s.\n"), m_addHeaders ? _T("on") : _T("off"));
+    AddMessage(RGY_LOG_INFO, _T("AV1 Format  : %s.\n"), m_av1Format == TSRReplaceAV1Format::Mpc ? _T("mpc (low overhead OBU)") : _T("spec (tsOBU)"));
     AddMessage(RGY_LOG_INFO, _T("Remove TypeD: %s.\n"), m_removeTypeD ? _T("on") : _T("off"));
     if (m_selectService) {
         if (m_selectService < 0) {
@@ -2125,20 +2140,28 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
         }
     }
 
-    // AV1 の場合、PES ペイロードは ts_open_bitstream_unit 形式 (start code + emulation prevention) が必要。
-    // "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 3.2 章参照。
+    // AV1 の場合の PES ペイロード形式は --av1-format で切り替える (PMT は両形式共通)。
+    //  spec (デフォルト): ts_open_bitstream_unit 形式 (start code + emulation prevention)。
+    //    "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 3.2 章参照。
+    //  mpc: low overhead OBU 列そのまま (全 OBU に obu_size を付与し、AU 先頭に temporal delimiter がなければ付与)。
+    //    MPC-BE 1.8.5 以降の内蔵 MpegSplitter 等、素の OBU 列を解釈するデマルチプレクサ向け。
     // またキーフレームで sequence header がなければ、先頭に sequence header OBU を付加する。
     std::vector<uint8_t> av1Payload;
     const uint8_t *payload = avpkt->data;
     int payloadSize = avpkt->size;
     if (replaceToAV1) {
+        const bool av1RawObu = (m_av1Format == TSRReplaceAV1Format::Mpc);
         if (addHeader) {
-            av1Payload = m_videoReplace->getAV1HeaderTsObu();
+            av1Payload = av1RawObu ? m_videoReplace->getAV1HeaderRawObu() : m_videoReplace->getAV1HeaderTsObu();
             if (av1Payload.empty()) {
                 AddMessage(RGY_LOG_WARN, _T("AV1: failed to get sequence header OBU, skip adding header.\n"));
             }
         }
-        vector_cat(av1Payload, av1_to_tsobu(avpkt->data, avpkt->size));
+        vector_cat(av1Payload, av1RawObu ? av1_to_low_overhead(avpkt->data, avpkt->size) : av1_to_tsobu(avpkt->data, avpkt->size));
+        if (av1RawObu) {
+            // AU の先頭に temporal delimiter がない場合は付与する (raw OBU 列を temporal unit として解釈するデマルチプレクサ向け)
+            av1_ensure_temporal_delimiter(av1Payload);
+        }
         payload = av1Payload.data();
         payloadSize = (int)av1Payload.size();
     }
@@ -2986,6 +3009,9 @@ static void show_help() {
 
         _T("   --(no-)add-aud               auto insert aud unit\n")
         _T("   --(no-)add-headers           auto insert headers\n")
+        _T("   --av1-format <string>        AV1 payload format in TS (default: spec)\n")
+        _T("                                 spec  draft-spec format (start code + emulation prevention)\n")
+        _T("                                 mpc   low overhead OBU stream (for MPC-BE 1.8.5+ etc.)\n")
         _T("   --startup-preroll <int>      MPEG-2/H.264/HEVC startup lead-in in ms (default 0)\n")
         _T("                                 0 disables; 1-60000 rounded up to 20 ms\n")
         _T("   --(no-)remove-typed          remove type-d packets\n")
@@ -3176,6 +3202,16 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
         prm.encoderPath = strInput[i++];
         for (; i < argc; i++) {
             prm.encoderArgs.push_back(strInput[i]);
+        }
+        return 0;
+    }
+    if (IS_OPTION("av1-format")) {
+        i++;
+        if (int value = get_value_from_chr(list_av1_format, strInput[i]); value != PARSE_ERROR_FLAG) {
+            prm.av1Format = (TSRReplaceAV1Format)value;
+        } else {
+            _ftprintf(stderr, _T("Unknown value for --%s: \"%s\""), option_name, strInput[i]);
+            return 1;
         }
         return 0;
     }

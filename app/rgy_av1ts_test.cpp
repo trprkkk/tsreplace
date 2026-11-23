@@ -355,9 +355,85 @@ static bool test_pmt_av1_registration_helper() {
     return g_fail == 0;
 }
 
+static bool test_av1_to_low_overhead() {
+    // size フィールド付き low overhead 列は無変換で一致すること
+    std::vector<uint8_t> stream;
+    auto td = make_low_obu(OBU_TEMPORAL_DELIMITER, {});
+    auto sh = make_low_obu(OBU_SEQUENCE_HEADER, { 0x0a, 0x0b, 0x00, 0x00, 0x05, 0x80 });
+    auto frame = make_low_obu(OBU_FRAME, { 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04 });
+    stream.insert(stream.end(), td.begin(), td.end());
+    stream.insert(stream.end(), sh.begin(), sh.end());
+    stream.insert(stream.end(), frame.begin(), frame.end());
+    const auto raw1 = av1_to_low_overhead(stream.data(), stream.size());
+    CHECK(raw1 == stream, "low overhead with size fields is unchanged");
+
+    // tsOBU (start code + emulation prevention) から low overhead に戻せること
+    const auto tsobu = av1_to_tsobu(stream.data(), stream.size());
+    const auto raw2 = av1_to_low_overhead(tsobu.data(), tsobu.size());
+    CHECK(raw2 == stream, "tsOBU -> low overhead restores original stream");
+
+    // size フィールドのない OBU (末尾に置く) には obu_size が付与されること
+    std::vector<uint8_t> nosize;
+    nosize.insert(nosize.end(), td.begin(), td.end());
+    const std::vector<uint8_t> payload = { 0x10, 0x00, 0x00, 0x07, 0x42 };
+    nosize.push_back((uint8_t)(gen_obu_header(OBU_FRAME) & ~0x02)); // has_size_flag=0
+    nosize.insert(nosize.end(), payload.begin(), payload.end());
+    const auto raw3 = av1_to_low_overhead(nosize.data(), nosize.size());
+    const auto obus3 = parse_obu_av1(raw3.data(), raw3.size());
+    CHECK(obus3.size() == 2, "no-size OBU: 2 OBUs after conversion");
+    if (obus3.size() == 2) {
+        CHECK(obus3[1].type == OBU_FRAME && obus3[1].has_size_flag, "no-size OBU gains obu_size");
+        CHECK(obus3[1].size == 1 + 1 + payload.size(), "no-size OBU size is header + leb128 + payload");
+        std::vector<uint8_t> got(obus3[1].ptr, obus3[1].ptr + obus3[1].size);
+        std::vector<uint8_t> expect = make_low_obu(OBU_FRAME, payload);
+        CHECK(got == expect, "no-size OBU converted to sized form");
+    }
+
+    // start code 形式で size フィールドのない OBU も変換できること
+    std::vector<uint8_t> sc_nosize = { 0x00, 0x00, 0x01 };
+    sc_nosize.push_back((uint8_t)(gen_obu_header(OBU_FRAME) & ~0x02));
+    sc_nosize.insert(sc_nosize.end(), payload.begin(), payload.end());
+    const auto raw4 = av1_to_low_overhead(sc_nosize.data(), sc_nosize.size());
+    CHECK(raw4 == make_low_obu(OBU_FRAME, payload), "startcode no-size OBU converted to sized low overhead");
+    return g_fail == 0;
+}
+
+static bool test_av1_ensure_temporal_delimiter() {
+    // TD のない AU には TD が付くこと
+    std::vector<uint8_t> au;
+    auto sh = make_low_obu(OBU_SEQUENCE_HEADER, { 0x0a, 0x0b, 0x00 });
+    auto frame = make_low_obu(OBU_FRAME, { 0x01, 0x02 });
+    au.insert(au.end(), sh.begin(), sh.end());
+    au.insert(au.end(), frame.begin(), frame.end());
+    std::vector<uint8_t> withTd = au;
+    av1_ensure_temporal_delimiter(withTd);
+    const auto obus = parse_obu_av1(withTd.data(), withTd.size());
+    CHECK(obus.size() == 3 && obus[0].type == OBU_TEMPORAL_DELIMITER, "TD prepended");
+    CHECK(withTd.size() == au.size() + 2, "TD adds 2 bytes");
+    // TD のある AU は無変換
+    std::vector<uint8_t> au2;
+    auto td = make_low_obu(OBU_TEMPORAL_DELIMITER, {});
+    au2.insert(au2.end(), td.begin(), td.end());
+    au2.insert(au2.end(), au.begin(), au.end());
+    std::vector<uint8_t> au2copy = au2;
+    av1_ensure_temporal_delimiter(au2copy);
+    CHECK(au2copy == au2, "AU with TD unchanged");
+    // 空データ・start code 形式には触らない
+    std::vector<uint8_t> empty;
+    av1_ensure_temporal_delimiter(empty);
+    CHECK(empty.empty(), "empty unchanged");
+    const auto tsobu = av1_to_tsobu(au.data(), au.size());
+    std::vector<uint8_t> tsobuCopy = tsobu;
+    av1_ensure_temporal_delimiter(tsobuCopy);
+    CHECK(tsobuCopy == tsobu, "tsOBU unchanged");
+    return g_fail == 0;
+}
+
 int main() {
     test_parse_obu_low_overhead();
     test_parse_obu_startcode();
+    test_av1_to_low_overhead();
+    test_av1_ensure_temporal_delimiter();
     test_seq_header_parse();
     test_pmt_av1_registration_helper();
     test_pmt_av1_detect();

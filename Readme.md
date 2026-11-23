@@ -41,7 +41,7 @@ tsreplaceを使用するには、コマンドラインから直接使用する�
 
 `tsreplace.exe -i <入力tsファイル> -r <置き換え映像ファイル> -o <出力tsファイル>`
 
-置き換え映像のコーデックは MPEG-2 / H.264 / HEVC / AV1 に対応しています。AV1で置き換える場合、["Carriage of AV1 in MPEG-2 TS"](https://aomediacodec.github.io/av1-mpeg2-ts/) (AOM Working Group Draft) に従い、PMTには stream_type 0x06 + registration descriptor 'AV01' + AV1 video descriptor を記載し、PESは private_stream_1 (stream_id 0xBD) で ts_open_bitstream_unit 形式のペイロードを運びます。
+置き換え映像のコーデックは MPEG-2 / H.264 / HEVC / AV1 に対応しています。AV1で置き換える場合、["Carriage of AV1 in MPEG-2 TS"](https://aomediacodec.github.io/av1-mpeg2-ts/) (AOM Working Group Draft) に従い、PMTには stream_type 0x06 + registration descriptor 'AV01' + AV1 video descriptor を記載し、PESは private_stream_1 (stream_id 0xBD) で ts_open_bitstream_unit 形式のペイロードを運びます。ペイロード形式は ```--av1-format``` で切り替えでき、```mpc``` を指定すると low overhead OBU 列そのまま (全 OBU に obu_size を付与) で出力します (MPC-BE 1.8.5 以降の内蔵スプリッタ等向け)。
 
 ## エンコードしながら置き換える
 下記のように、2段階に分けずエンコードしながら置き換えを行うこともできます。
@@ -285,6 +285,12 @@ TvtPlayが約500msを先行送信する間に、TVTestがPMTから非同期で�
 
 ### --no-add-aud
 映像パケットごとのAUDの自動挿入を無効にします。
+
+### --av1-format &lt;string&gt;
+AV1で置き換える場合の、PESペイロード形式を指定します。(デフォルト：spec)
+
+- ```spec``` … "Carriage of AV1 in MPEG-2 TS" (AOM Working Group Draft) 準拠の ts_open_bitstream_unit 形式 (start code + emulation prevention) で出力します。
+- ```mpc``` … low overhead OBU 列そのまま (全 OBU に obu_size を付与し、AU 先頭に temporal delimiter がなければ付与) で出力します。MPC-BE 1.8.5 以降の内蔵 MpegSplitter など、素の OBU 列を直接解釈するデマルチプレクサで再生するための形式です。PMT (stream_type 0x06 + registration descriptor 'AV01' + AV1 video descriptor) は spec と共通です。
 
 ### --add-headers
 映像のキーフレームごとにヘッダを自動挿入します。(デフォルト：オン)

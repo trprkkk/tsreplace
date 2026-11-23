@@ -1040,6 +1040,95 @@ std::vector<av1_obu_info> parse_obu_av1(const uint8_t *data, size_t size) {
     return list;
 }
 
+// raw OBU 1つ分を low overhead 形式で out に追加する。
+// obu_size を持つ OBU はその長さで切り詰め、持たない OBU には obu_size を付与する。
+// followed_by_sc が true の場合、末尾の 0x00 は次 start code の zero_byte の可能性があるため、
+// obu_size による切り詰め (size あり) / 末尾 0x00 の除去 (size なし) で吸収する。
+static void av1_append_obu_low_overhead(std::vector<uint8_t> &out, const std::vector<uint8_t> &raw, const bool followed_by_sc) {
+    uint8_t has_size_flag = 0;
+    const size_t hdr_len = av1_obu_header_len(raw.data(), raw.size(), nullptr, &has_size_flag, nullptr, nullptr);
+    if (hdr_len == 0) {
+        // ヘッダとして解釈できないものはそのまま出力する
+        out.insert(out.end(), raw.begin(), raw.end());
+        return;
+    }
+    if (has_size_flag) {
+        size_t leb_len = 0;
+        const uint64_t obu_size = av1_read_uleb128(raw.data() + hdr_len, raw.size() - hdr_len, &leb_len);
+        const size_t expected = hdr_len + leb_len + (size_t)obu_size;
+        const size_t len = (std::min)(raw.size(), expected);
+        out.insert(out.end(), raw.begin(), raw.begin() + len);
+    } else {
+        // obu_size フィールドがない OBU は、ヘッダの has_size ビットを立てて
+        // payload サイズを leb128 で挿入する (payload 自体は変更しない)
+        size_t payload_len = raw.size() - hdr_len;
+        if (followed_by_sc && payload_len > 0 && raw.back() == 0x00) {
+            payload_len--; // 4byte start code の先頭 0x00
+        }
+        out.push_back((uint8_t)(raw[0] | 0x02));
+        out.insert(out.end(), raw.begin() + 1, raw.begin() + hdr_len);
+        const auto sz = get_av1_uleb_size_data((uint64_t)payload_len);
+        out.insert(out.end(), sz.begin(), sz.end());
+        out.insert(out.end(), raw.begin() + hdr_len, raw.begin() + hdr_len + payload_len);
+    }
+}
+
+std::vector<uint8_t> av1_to_low_overhead(const uint8_t *data, size_t size) {
+    std::vector<uint8_t> out;
+    if (data == nullptr || size == 0) {
+        return out;
+    }
+    size_t sc_len = 0;
+    if (av1_start_code_at(data, size, &sc_len)) {
+        // start code 形式 (tsOBU / Annex B): start code 位置で自前で区切る。
+        // parse_obu_av1 の区切りは末尾の 0x00 を次 start code 側に寄せるため、
+        // obu_size が 0x00 で終わる OBU (temporal delimiter 等) が欠けてしまう。
+        // ここでは区切った後に obu_size で長さを確定させる。
+        static const uint8_t SC[3] = { 0x00, 0x00, 0x01 };
+        std::vector<size_t> scPos;
+        for (size_t i = 0; i + 3 <= size; ) {
+            const auto next = rgy_memmem_c((const void *)(data + i), size - i, (const void *)SC, sizeof(SC));
+            if (next == RGY_MEMMEM_NOT_FOUND) break;
+            i += (size_t)next;
+            scPos.push_back(i);
+            i += 3;
+        }
+        out.reserve(size + scPos.size() * 2 + 16);
+        for (size_t s = 0; s < scPos.size(); s++) {
+            const size_t segStart = scPos[s] + 3;
+            const size_t segEnd = (s + 1 < scPos.size()) ? scPos[s + 1] : size;
+            if (segEnd <= segStart) continue;
+            // emulation prevention を除去して raw OBU に戻す
+            const std::vector<uint8_t> raw = unnal(data + segStart, segEnd - segStart);
+            av1_append_obu_low_overhead(out, raw, s + 1 < scPos.size());
+        }
+        return out;
+    }
+    // low overhead 形式
+    const auto obus = parse_obu_av1(data, size);
+    if (obus.empty()) {
+        // OBU として解釈できない場合はそのまま返す
+        out.assign(data, data + size);
+        return out;
+    }
+    out.reserve(size + obus.size() * 2 + 16);
+    for (const auto &obu : obus) {
+        const std::vector<uint8_t> raw(obu.ptr, obu.ptr + obu.size);
+        av1_append_obu_low_overhead(out, raw, false);
+    }
+    return out;
+}
+
+void av1_ensure_temporal_delimiter(std::vector<uint8_t> &data) {
+    if (data.empty()) return;
+    size_t sc_len = 0;
+    if (av1_start_code_at(data.data(), data.size(), &sc_len)) return; // start code 形式には触らない
+    const auto obus = parse_obu_av1(data.data(), data.size());
+    if (!obus.empty() && obus[0].type == OBU_TEMPORAL_DELIMITER) return;
+    static const uint8_t TD[2] = { 0x12, 0x00 }; // temporal_delimiter_obu (header + obu_size=0)
+    data.insert(data.begin(), TD, TD + sizeof(TD));
+}
+
 std::vector<uint8_t> av1_to_tsobu(const uint8_t *data, size_t size) {
     std::vector<uint8_t> out;
     const auto obus = parse_obu_av1(data, size);
